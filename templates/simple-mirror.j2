@@ -1,0 +1,78 @@
+#jinja2: lstrip_blocks: True
+#!/bin/bash
+# {{ ansible_managed }}
+
+{% set _rsync = item.rsync|default(dist_mirror_rsync)%}
+{% if dist_mirrors[item].proxy_host is defined %}
+{% set _proxy = dist_mirrors[item].proxy_host %}
+{% elif dist_mirrors.proxy_host is defined and (dist_mirrors[item].no_proxy is undefined or dist_mirrors[item].no_proxy == false) %}
+{% set _proxy = dist_mirrors.proxy_host %}
+{% elif proxy_host is defined and proxy_enabled is defined and proxy_enabled == "yes" and (dist_mirrors[item].no_proxy is undefined or dist_mirrors[item].no_proxy == false) %}
+{% set _proxy = proxy_host %}
+{% endif %}
+
+{% if _proxy is defined %}
+export RSYNC_PROXY={{_proxy}}
+export http_proxy={{_proxy}}
+export https_proxy={{_proxy}}
+export PROXY={{_proxy}}
+{% endif %}
+
+{% set _mirror_suffix = dist_mirrors[item].directory|default(item) %}
+{% if dist_mirrors[item].mirror_base is defined %}
+{% set _mirror_dir = dist_mirrors[item].mirror_base + '/' + _mirror_suffix %}
+{% else %}
+{% set _mirror_dir = dist_mirrors.mirror_base + '/' + _mirror_suffix %}
+{% endif %}
+
+mkdir -p {{_mirror_dir}}/
+
+{% if item == 'opensuse' or item.type|default('') == 'opensuse' %}
+  {% set _mirror_source = dist_mirrors[item].mirror_source|default('rsync.nic.funet.fi::ftp/pub/mirrors/ftp.opensuse.com/pub/opensuse') %}
+{{_rsync}} {{_mirror_source}} {{_mirror_dir}}/ {% if dist_mirrors[item].includes is defined %}{% for include in dist_mirrors[item].includes %}--include "{{include}}" {% endfor %}{% endif %}{% if dist_mirrors[item].excludes is defined %}{% for exclude in dist_mirrors[item].excludes %}--exclude "{{exclude}}" {% endfor %}{% endif %}
+{% elif item == 'centos' %}
+  {% if dist_mirrors[item].releases is defined %}
+  {% set _centos_releases = dist_mirrors[item].releases|join(" ") %}
+  {% else %}
+  {% set _centos_releases = "7 8" %}
+  {% endif %}
+CENTOS_RELEASES="{{_centos_releases}}"
+
+mkdir -p {{dist_mirrors.mirror_base}}/CentOS/
+for _REL in $CENTOS_RELEASES; do
+  {{_rsync}} rsync.nic.funet.fi::ftp/pub/mirrors/centos.org/$_REL/ {{_mirror_dir}}/$_REL/
+done
+
+  {% if dist_mirrors[item].archived_releases is defined %}
+CENTOS_ARCHIVED_RELEASES="{{dist_mirrors[item].archived_releases|join(" ")}}"
+
+for _REL in $CENTOS_ARCHIVED_RELEASES; do
+    {{_rsync}} rsync://archive.kernel.org/centos-vault/$_REL/ {{_mirror_dir}}/$_REL/
+done
+  {% endif %}
+{% elif item == 'elrepo' %}
+{{_rsync}} lon.mirror.rackspace.com::elrepo/ {{_mirror_dir}} {% if dist_mirrors.elrepo.excludes is defined %}{% for exclude in dist_mirrors.elrepo.excludes %}--exclude "{{exclude}}" {% endfor %}{% endif %}
+{% elif item == 'py-modules' %}
+  {% if dist_mirrors[item].pyvers is defined %}
+  {% set _pyvers = dist_mirrors[item].pyvers|join(" ") %}
+  {% else %}
+  {% set _pyvers = "36" %}
+  {% endif %}
+
+PYVERS="{{_pyvers}}"
+PLATFORMS="{{_platforms}}"
+IMPL="cp"
+
+for PYVER in $PYVERS; do
+  REQF="${DEST}/py${PYVER}.requirements"
+  if test -f "${REQF}"; then
+    mkdir -p "${DEST}"
+    while read REQ; do
+      pip3 download --proxy "${PROXY}" --no-binary=:all: "${REQ}" -d "${DEST}"
+      for PLAT in $PLATFORMS; do
+        pip3 download --proxy "${PROXY}" --platform ${PLAT} --python-version ${PYVER} --implementation cp --abi cp${PYVER}m --only-binary=:all: "${REQ}" -d "${DEST}"
+      done
+    done < "${REQF}"
+  fi
+done
+{% endif %}

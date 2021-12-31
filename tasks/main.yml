@@ -1,0 +1,68 @@
+- set_fact:
+    dist_mirror_rsync: "rsync -rlptDvzvSHPhi --stats --chmod=D755,F644 --delete --delete-after --delete-excluded"
+
+- set_fact:
+    _supported_mirrors:
+      - centos
+      - opensuse
+      - elrepo
+      - py-modules
+
+- set_fact:
+    dist_mirrors: {}
+  when: dist_mirrors is undefined
+
+- name: add dist mirror group
+  group:
+    name: "{{dist_mirrors.group|default(dist_mirrors.user)}}"
+    system: yes
+  when: >
+    dist_mirrors.group is defined or
+    dist_mirrors.user is defined
+
+- name: add dist mirror
+  user:
+    name: "{{dist_mirrors.user}}"
+    group: "{{dist_mirrors.group|default(dist_mirrors.user)}}"
+    createhome: yes
+    home: "{{dist_mirrors.mirror_base}}"
+    system: yes
+  when: >
+    dist_mirrors.user is defined
+
+- name: chown dist mirror directory
+  file:
+    path: "{{dist_mirrors.mirror_base}}"
+    owner: "{{dist_mirrors.user}}"
+  when: >
+    dist_mirrors.user is defined
+
+- name: create dist-mirror directory
+  file:
+    state: directory
+    path: /usr/lib/dist-mirror
+    mode: 0755
+
+- name: copy main mirror scripts
+  template:
+    src: "simple-mirror.j2"
+    dest: /usr/lib/dist-mirror/{{item}}
+    mode: 0755
+  with_items: "{{ _supported_mirrors }}"
+  when: dist_mirrors[item] is defined
+
+- name: enable timers
+  include_role:
+    name: basic-host
+    tasks_from: add_timer
+  with_items: "{{_supported_mirrors}}"
+  when: >
+    dist_mirrors[item] is defined and
+    (dist_mirrors[item].timer_enabled is undefined or
+     dist_mirrors[item].timer_enabled != no) and
+    dist_mirrors[item].times is defined
+  vars:
+    systemd_timer_name: "dist-mirror@{{item}}"
+    systemd_timer_oncalendar: "{{dist_mirrors[item].times}}"
+    systemd_timer_command: "/usr/lib/dist-mirror/%i"
+    systemd_timer_user: "{{dist_mirrors.user|default('root')}}"
