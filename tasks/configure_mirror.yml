@@ -1,0 +1,20 @@
+- name: copy main mirror scripts
+  template:
+    src: "simple-mirror.j2"
+    dest: /usr/lib/dist-mirror/{{mirror.key}}
+    mode: 0755
+
+- name: enable timers
+  include_role:
+    name: basic-host
+    tasks_from: add_timer
+  when: >
+    (mirror.value.timer_enabled is undefined or
+     mirror.value.timer_enabled != no) and
+     mirror.value.times is defined
+  vars:
+    systemd_timer_name: "dist-mirror@{{mirror.key}}"
+    systemd_timer_oncalendar: "{{mirror.value.times}}"
+    systemd_timer_command: "/usr/lib/dist-mirror/%i"
+    systemd_timer_user: "{{dist_mirrors.user|default('root')}}"
+    systemd_timer_randomized_delay_sec: "{{mirror.value.delay|default(1800)}}"

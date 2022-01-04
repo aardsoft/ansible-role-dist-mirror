@@ -1,3 +1,5 @@
+# TODO:
+# - install rsync, ..; install zsh if fedora or epel mirrors are defined
 - set_fact:
     dist_mirror_rsync: "rsync -rlptDvzvSHPhi --stats --chmod=D755,F644 --delete --delete-after --delete-excluded"
 
@@ -43,26 +45,12 @@
     path: /usr/lib/dist-mirror
     mode: 0755
 
-- name: copy main mirror scripts
-  template:
-    src: "simple-mirror.j2"
-    dest: /usr/lib/dist-mirror/{{item}}
-    mode: 0755
-  with_items: "{{ _supported_mirrors }}"
-  when: dist_mirrors[item] is defined
-
-- name: enable timers
-  include_role:
-    name: basic-host
-    tasks_from: add_timer
-  with_items: "{{_supported_mirrors}}"
+- name: configure mirrors
+  include_tasks: configure_mirror.yml
+  with_dict: "{{dist_mirrors}}"
+  loop_control:
+    loop_var: mirror
   when: >
-    dist_mirrors[item] is defined and
-    (dist_mirrors[item].timer_enabled is undefined or
-     dist_mirrors[item].timer_enabled != no) and
-    dist_mirrors[item].times is defined
-  vars:
-    systemd_timer_name: "dist-mirror@{{item}}"
-    systemd_timer_oncalendar: "{{dist_mirrors[item].times}}"
-    systemd_timer_command: "/usr/lib/dist-mirror/%i"
-    systemd_timer_user: "{{dist_mirrors.user|default('root')}}"
+    mirror.key in _supported_mirrors or
+    (mirror.value.type is defined and
+     mirror.value.type in _supported_mirrors)
