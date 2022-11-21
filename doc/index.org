@@ -1,0 +1,148 @@
+* Introduction
+This role helps in setting up rsync based mirrors of various Linux distributions. Currently supported are:
+
+- openSUSE
+- CentOS
+- elrepo
+- py-modules
+
+Fedora and EPEL are not supported as the recommended way for mirroring those is using [[https://pagure.io/quick-fedora-mirror][quick-fedora-mirror]].
+
+Each profile will generate a mirror script in =/usr/lib/dist-mirror=, and create a matching systemd service. For example, a profile for =opensuse= will create =/usr/lib/dist-mirror/opensuse=, with =dist-mirror@opensuse.service= to start it, and optionally =dist-mirror@opensuse.timer= to autostart it.
+
+Note that currently only the openSUSE mirror is verified to behave according to this documentation - the other mirrors may have site specific hardcoded values which will need to be fixed eventually.
+
+* Configuration
+A variable named =dist_mirrors= is used for configuration, with the following top level keys:
+
+** proxy_host
+The name of a proxy server to use. It is not possible to configure individual proxies for different sync profiles, but a sync profile can disable the global proxy by setting =no_proxy= to =true=.
+
+** mirror_base
+The absolute path to the directory storing the local mirror. This key is mandatory. Sync profiles can override it by setting a profile specific mirror_base.
+
+** centos
+Settings for a CentOS mirror. In addition to the generic keys listed below this profile also supports the following:
+
+*** releases
+A list of CentOS releases to mirror. Defaults to 7 and 8 if unset.
+
+#+BEGIN_SRC yaml
+releases:
+  - 8
+#+END_SRC
+
+*** archived_releases
+A list of CentOS archived releases to pull from archive.kernel.org.
+
+#+BEGIN_SRC yaml
+archived_releases:
+  - 7.6.1810
+  - 7.7.1908
+#+END_SRC
+
+** opensuse
+Settings for an openSUSE mirror.
+
+** elrepo
+Settings for an elrepo mirror.
+
+** py-modules
+A list of python modules to mirror via =pip3 download=. WIP.
+
+** common keys for all profiles
+*** times
+A time specification suitable for [[https://www.freedesktop.org/software/systemd/man/systemd.timer.html][a systemd timer]]. If set this will create and enable a timer to start the sync service for the profile.
+*** excludes
+A list of patterns to pass to rsync as excludes, in the syntax described in the rsync documentation.
+*** includes
+A list of patterns to pass to rsync as includes.
+*** mirror_source
+The host and module or path to pull from. Examples are =mirror.aardsoft.fi::opensuse/opensuse/= or =rsync://archive.kernel.org/centos-vault/=.
+*** no_proxy
+When set to =false= disables a globally set proxy for a specific profile.
+*** rsync
+Binary name and arguments to rsync. Defaults to =rsync -rlptDvzvSHPhi --stats --chmod=D755,F644 --delete --delete-after --delete-excluded=
+
+* Examples
+** Full openSUSE mirror with repositories
+
+#+BEGIN_SRC yaml
+dist_mirrors:
+  mirror_base: /srv/mirror
+  user: mirror
+  opensuse:
+    times: "*-*-* 00/5:00:00"
+    rsync: rsync -4 -rlpt --delay-updates --delete-delay --max-delete=400000 --timeout=1800 -hi
+    mirror_source: 'stage.opensuse.org::opensuse-full-with-factory/opensuse/'
+    excludes:
+      - '.~tmp~'
+      - /repositories/
+  opensuse_repositories:
+    type: opensuse
+    times: "2024-*-* 08:30:00"
+    rsync: rsync -4 -rlpt --delay-updates --delete-delay --delete-excluded --max-delete=4000 --timeout=1800 -hi
+    directory: repositories/
+    mirror_base: /srv/mirror/opensuse
+    mirror_source: 'stage.opensuse.org::buildservice-repos/'
+    excludes:
+      - '.~tmp~'
+#+END_SRC
+
+** CentOS 7, EPEL and limited openSUSE mirror
+
+#+BEGIN_SRC yaml
+dist_mirrors:
+  mirror_base: /srv/cache/mirrors/
+  centos:
+    times: "*-*-* 19:05:00"
+    releases:
+      - 7
+    archived_releases:
+      - 7.6.1810
+      - 7.7.1908
+    excludes:
+      - 'local*'
+      - 'Source/'
+      - 'isos'
+  elrepo:
+    excludes:
+      - 'local*'
+      - 'isos'
+      - 'el5/'
+      - 'el6/'
+      - 'el8/'
+  opensuse:
+    times: "*-*-* 08:30:00"
+    mirror_source: 'mirror.aardsoft.fi::opensuse/'
+    excludes:
+      - '.~tmp~'
+      - '/debug'
+      - '/FOSDEM'
+      - '/discontinued'
+      - '/education'
+      - '/project'
+      - '/source'
+      - '/repositories'
+      - '/history'
+      - 'armv6hl/'
+      - '/ports/debug'
+      - 'ppc/'
+      - 'riscv/'
+      - 'zsystems/'
+      - '42.3'
+      - '42.2'
+      - '42.1'
+      - 'leap/15.0'
+      - 'leap/15.1'
+      - 'leap/15.2'
+      - 'leap/15.4'
+      - 'leap/15.5'
+      - '-test/'
+      - '*.xz'
+      - '*.vmx'
+      - '*.qcow2'
+      - '*.box'
+      - '*Snapshot*.iso'
+      - '*.iso'
+#+END_SRC

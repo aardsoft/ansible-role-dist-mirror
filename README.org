@@ -1,0 +1,1 @@
+This is a simple, self-contained role to help setting up distribution mirrors. See the full documentation for the [[https://doc-head.aardsoft.fi/ansible/dist-mirror/][development version]].
