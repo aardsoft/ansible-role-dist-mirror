@@ -45,6 +45,23 @@
     path: /usr/lib/dist-mirror
     mode: 0755
 
+- name: create dist-mirror configuration directory
+  file:
+    state: directory
+    path: /etc/dist-mirror
+    mode: 0755
+
+- name: copy scripts
+  ansible.builtin.copy:
+    src: "{{file}}"
+    dest: "{{local_bin|default('/usr/local/bin')}}/{{file}}"
+    owner: root
+    mode: '0755'
+  loop_control:
+    loop_var: file
+  with_items: >
+    - dist-mirror-iso
+
 - name: configure mirrors
   include_tasks: configure_mirror.yml
   with_dict: "{{dist_mirrors}}"

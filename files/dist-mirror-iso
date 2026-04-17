@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+
+# mirror-iso.sh
+# Downloads distribution ISOs (and optional appliance images) by snapshot date,
+# then extracts them to a mirror directory.
+#
+# For microOS the appliance image is required for netboot - there's a good
+# chance we don't need that mechanism for other distributions, but if it's
+# not configured for a distribution it's just a no-op.
+
+set -euo pipefail
+
+CONFIG_DIR="${CONFIG_DIR:-/etc/dist-mirror}"
+CONFIG_FILE="${CONFIG_FILE:-${CONFIG_DIR}/mirror-iso.conf}"
+
+# Distribution tables - declared before sourcing config so that config can add
+# or override individual entries.  {DATE} is replaced with YYYYMMDD at runtime.
+# For other distributions we may eventually need to support date format.
+declare -A DIST_ISO_URL
+declare -A DIST_APPLIANCE_URL   # leave entry absent / empty to skip appliance
+
+DIST_ISO_URL["openSUSE-MicroOS"]="https://mirror.aardsoft.fi/opensuse/tumbleweed/iso/openSUSE-MicroOS-DVD-x86_64-Snapshot{DATE}-Media.iso"
+DIST_APPLIANCE_URL["openSUSE-MicroOS"]="https://mirror.aardsoft.fi/opensuse/tumbleweed/appliances/openSUSE-MicroOS.x86_64-16.0.0-SelfInstall-Snapshot{DATE}.install.tar"
+
+# Load configuration (may override the above or add new distributions)
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    echo "Warning: Config file not found at $CONFIG_FILE, using defaults"
+fi
+
+# defaults, if above config load didn't set the variables
+BASE_DIR="${BASE_DIR:-/var/mirror}"
+ISO_DIR="${ISO_DIR:-${BASE_DIR}/isos}"
+HOOKS_DIR="${HOOKS_DIR:-${CONFIG_DIR}/hooks}"
+MAX_DAYS_BACK="${MAX_DAYS_BACK:-7}"
+
+# variables not controlled by config
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+EXTRACT_PATH=""
+OPT_RE_EXTRACT=false
+OPT_CURRENT=false
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+log() {
+    local level="$1"
+    shift
+    local msg="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local log_msg="[${timestamp}] [${level}] ${msg}"
+    if [[ -n "${EXTRACT_PATH:-}" ]]; then
+        local log_file="${EXTRACT_PATH}/logs/mirror-iso_${TIMESTAMP}.log"
+        mkdir -p "$(dirname "$log_file")"
+        echo "$log_msg" | tee -a "$log_file"
+    else
+        echo "$log_msg"
+    fi
+}
+
+log_info()  { log "INFO"  "$@"; }
+log_error() { log "ERROR" "$@"; }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Substitute {DATE} placeholder in a URL pattern
+make_url() {
+    local pattern="$1"
+    local date="$2"
+    echo "${pattern/\{DATE\}/$date}"
+}
+
+# Return true if URL responds with a success status (HEAD request)
+url_exists() {
+    local url="$1"
+    curl -fLIsS "$url" -o /dev/null 2>/dev/null
+}
+
+# Return YYYYMMDD of the date N days before the given YYYYMMDD
+date_subtract() {
+    local date_str="$1"
+    local days="$2"
+    date -d "${date_str:0:4}-${date_str:4:2}-${date_str:6:2} - ${days} days" +%Y%m%d
+}
+
+# Walk back from start_date until the ISO URL for a distribution responds.
+# Sets global FOUND_DATE and returns 0 on success, returns 1 if none found.
+# (Uses a global rather than command substitution so log_info output is visible.)
+FOUND_DATE=""
+find_snapshot_date() {
+    local distro="$1"
+    local start_date="$2"
+    local pattern="${DIST_ISO_URL[$distro]}"
+    FOUND_DATE=""
+
+    local current_date="$start_date"
+    local i
+    for ((i=0; i<=MAX_DAYS_BACK; i++)); do
+        local url
+        url=$(make_url "$pattern" "$current_date")
+        log_info "Trying: $url"
+        if url_exists "$url"; then
+            FOUND_DATE="$current_date"
+            return 0
+        fi
+        current_date=$(date_subtract "$current_date" 1)
+    done
+    return 1
+}
+
+# Download url to dest, skipping if dest already exists.
+# Uses a .tmp file while downloading to avoid partial files.
+# If a .sha256 sidecar exists at "${url}.sha256" it is downloaded and used to
+# verify the file; an existing dest whose checksum matches is skipped.
+download_file() {
+    local url="$1"
+    local dest="$2"
+    local dest_dir
+    dest_dir="$(dirname "$dest")"
+    local sha256_dest="${dest}.sha256"
+    local has_sha256=false
+
+    mkdir -p "$dest_dir"
+
+    # Fetch sha256 sidecar if available
+    if url_exists "${url}.sha256"; then
+        curl -fLsS "${url}.sha256" -o "$sha256_dest"
+        has_sha256=true
+    fi
+
+    # If the destination already exists, verify (or just skip) before downloading
+    if [[ -f "$dest" ]]; then
+        if $has_sha256; then
+            log_info "Verifying existing $(basename "$dest")..."
+            if (cd "$dest_dir" && sha256sum -c "$(basename "$sha256_dest")" --quiet 2>/dev/null); then
+                log_info "Already present and verified, skipping: $(basename "$dest")"
+                return 0
+            else
+                log_info "Checksum mismatch, re-downloading: $(basename "$dest")"
+                rm -f "$dest"
+            fi
+        else
+            log_info "Already present, skipping download: $(basename "$dest")"
+            return 0
+        fi
+    fi
+
+    log_info "Downloading $(basename "$dest") from $url"
+    curl -fL --progress-bar "$url" -o "${dest}.tmp"
+    mv "${dest}.tmp" "$dest"
+
+    if $has_sha256; then
+        log_info "Verifying $(basename "$dest")..."
+        if ! (cd "$dest_dir" && sha256sum -c "$(basename "$sha256_dest")" --quiet); then
+            log_error "SHA256 verification failed for $(basename "$dest")"
+            rm -f "$dest"
+            return 1
+        fi
+        log_info "SHA256 verified"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# ISO detection / extraction
+# ---------------------------------------------------------------------------
+
+# Detect distribution name and version from an ISO file.
+# Sets globals DISTRO and VERSION on success.
+detect_iso_info() {
+    local iso_file="$1"
+
+    # 1. SUSE (MicroOS / Leap / Tumbleweed)
+    local suse_info
+    suse_info=$(bsdtar -xf "$iso_file" -O "media.1/products" 2>/dev/null) || true
+    if [[ -n "$suse_info" ]]; then
+        DISTRO=$(echo "$suse_info" | awk '{print $2}')
+        VERSION=$(echo "$suse_info" | awk '{print $3}')
+        return 0
+    fi
+
+    # 2. Ubuntu / Debian (untested)
+    local disk_info
+    disk_info=$(bsdtar -xf "$iso_file" -O ".disk/info" 2>/dev/null) || true
+    if [[ -n "$disk_info" ]]; then
+        DISTRO="Ubuntu"
+        VERSION=$(echo "$disk_info" | awk '{print $2}')
+        return 0
+    fi
+
+    # 3. Fedora / RHEL / CentOS (untested)
+    local tree_info
+    tree_info=$(bsdtar -xf "$iso_file" -O ".treeinfo" 2>/dev/null) || true
+    if [[ -n "$tree_info" ]]; then
+        DISTRO=$(echo "$tree_info" | grep "^family"  | cut -d'=' -f2 | tr -d ' ')
+        VERSION=$(echo "$tree_info" | grep "^version" | cut -d'=' -f2 | tr -d ' ')
+        return 0
+    fi
+
+    return 1
+}
+
+extract_iso() {
+    local iso_file="$1"
+    log_info "Extracting $(basename "$iso_file") to $EXTRACT_PATH"
+    bsdtar -xf "$iso_file" -C "$EXTRACT_PATH"
+    log_info "Extraction complete"
+}
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+
+run_hooks() {
+    local distro="$1"
+    local version="$2"
+    local iso_file="$3"
+
+    [[ -d "$HOOKS_DIR" ]] || return 0
+
+    for hook in "$HOOKS_DIR"/*; do
+        if [[ -x "$hook" ]]; then
+            log_info "Running hook: $hook"
+            "$hook" "$distro" "$version" "$EXTRACT_PATH" "$iso_file" || {
+                log_error "Hook $hook failed"
+                return 1
+            }
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Symlink management
+# ---------------------------------------------------------------------------
+
+# Create or update BASE_DIR/{distro}/current -> version.
+# Creates the link when absent; updates it only when --current was given.
+#
+# Two-step promotion workflow:
+#   Step 1 – download, extract, validate (no link update):
+#     mirror-iso.sh --distro openSUSE-MicroOS --date 20260415
+#   Step 2 – promote to current after testing:
+#     mirror-iso.sh --distro openSUSE-MicroOS --date 20260415 --current
+#   Step 2 is fast: downloads and extraction are skipped (already done),
+#   only the symlink is updated.
+manage_current_link() {
+    local distro="$1"
+    local version="$2"
+    local link="${BASE_DIR}/${distro}/current"
+
+    if [[ -L "$link" ]]; then
+        if $OPT_CURRENT; then
+            log_info "Updating 'current' link: $link -> $version"
+            ln -sfn "$version" "$link"
+        else
+            log_info "Keeping existing 'current' link ($(readlink "$link")); use --current to update"
+        fi
+    else
+        log_info "Creating 'current' link: $link -> $version"
+        ln -sfn "$version" "$link"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Per-distribution processing
+# ---------------------------------------------------------------------------
+
+process_distro() {
+    local distro="$1"
+    local snapshot_date="$2"   # YYYYMMDD
+
+    local distro_iso_dir="${ISO_DIR}/${distro}"
+    mkdir -p "$distro_iso_dir"
+
+    # --- Download ISO ---
+    local iso_url
+    iso_url=$(make_url "${DIST_ISO_URL[$distro]}" "$snapshot_date")
+    local iso_file="${distro_iso_dir}/$(basename "$iso_url")"
+    download_file "$iso_url" "$iso_file"
+
+    # --- Download appliance / self-installer (if configured) ---
+    local appliance_file=""
+    local appliance_url_pattern="${DIST_APPLIANCE_URL[$distro]:-}"
+    if [[ -n "$appliance_url_pattern" ]]; then
+        local appliance_url
+        appliance_url=$(make_url "$appliance_url_pattern" "$snapshot_date")
+        appliance_file="${distro_iso_dir}/$(basename "$appliance_url")"
+        if url_exists "$appliance_url"; then
+            download_file "$appliance_url" "$appliance_file"
+        else
+            log_info "Appliance not available: $appliance_url"
+            appliance_file=""
+        fi
+    fi
+
+    # --- Detect version from ISO ---
+    log_info "Detecting distribution info from $iso_file..."
+    if ! detect_iso_info "$iso_file"; then
+        log_error "Could not detect distribution info from $iso_file"
+        return 1
+    fi
+    local version="$VERSION"
+
+    # --- Set up extract path ---
+    EXTRACT_PATH="${BASE_DIR}/${distro}/${version}"
+
+    # --- Skip or re-extract based on whether .mirror-info marker exists ---
+    local do_extract=true
+    if [[ -f "${EXTRACT_PATH}/.mirror-info" ]]; then
+        if $OPT_RE_EXTRACT; then
+            log_info "Re-extracting: removing $EXTRACT_PATH"
+            rm -rf "$EXTRACT_PATH"
+        else
+            log_info "Already extracted, skipping: $EXTRACT_PATH"
+            do_extract=false
+        fi
+    fi
+
+    if $do_extract; then
+        mkdir -p "$EXTRACT_PATH"
+        mkdir -p "${EXTRACT_PATH}/logs"
+
+        log_info "Processing: $(basename "$iso_file") ($distro $version)"
+        log_info "Extract path: $EXTRACT_PATH"
+
+        # --- Extract ISO ---
+        extract_iso "$iso_file"
+
+        # --- Extract appliance into same tree ---
+        if [[ -n "$appliance_file" ]]; then
+            log_info "Extracting appliance $(basename "$appliance_file") to $EXTRACT_PATH"
+            tar -xf "$appliance_file" -C "$EXTRACT_PATH"
+            log_info "Appliance extracted"
+        fi
+
+        # --- Run hooks ---
+        run_hooks "$distro" "$version" "$iso_file"
+
+        # --- Write marker ---
+        cat > "${EXTRACT_PATH}/.mirror-info" << EOF
+distro=$distro
+version=$version
+snapshot_date=$snapshot_date
+extracted_at=$(date -Iseconds)
+source_iso=$iso_file
+EOF
+    fi
+
+    # --- Manage 'current' symlink ---
+    manage_current_link "$distro" "$version"
+
+    log_info "Done: $distro $version"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+Usage: $0 [--distro DISTRO] [--date YYYYMMDD] [--re-extract] [--current]
+
+Options:
+  --distro DISTRO    Process a specific distribution (default: all configured)
+  --date YYYYMMDD    Use this exact snapshot date; if omitted, walk back from
+                     today up to MAX_DAYS_BACK (default: $MAX_DAYS_BACK) days
+  --re-extract       Remove and re-extract even if target directory exists
+  --current          Update the 'current' symlink even if one already exists
+  --help             Show this help
+
+Configured distributions: ${!DIST_ISO_URL[*]}
+EOF
+}
+
+main() {
+    local opt_distro=""
+    local opt_date=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --distro)
+                opt_distro="$2"
+                shift 2
+                ;;
+            --date)
+                opt_date="$2"
+                shift 2
+                ;;
+            --re-extract)
+                OPT_RE_EXTRACT=true
+                shift
+                ;;
+            --current)
+                OPT_CURRENT=true
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown argument: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Build list of distributions to process
+    local distros=()
+    if [[ -n "$opt_distro" ]]; then
+        if [[ -z "${DIST_ISO_URL[$opt_distro]:-}" ]]; then
+            log_error "Unknown distribution: $opt_distro"
+            log_error "Configured distributions: ${!DIST_ISO_URL[*]}"
+            exit 1
+        fi
+        distros=("$opt_distro")
+    else
+        distros=("${!DIST_ISO_URL[@]}")
+    fi
+
+    local today
+    today=$(date +%Y%m%d)
+
+    for distro in "${distros[@]}"; do
+        local snapshot_date="$opt_date"
+
+        if [[ -z "$snapshot_date" ]]; then
+            log_info "[$distro] Searching for latest snapshot (up to $MAX_DAYS_BACK days back)..."
+            if ! find_snapshot_date "$distro" "$today"; then
+                log_error "[$distro] No snapshot found in the last $MAX_DAYS_BACK days"
+                continue
+            fi
+            snapshot_date="$FOUND_DATE"
+            log_info "[$distro] Found snapshot: $snapshot_date"
+        else
+            # Verify the requested date is actually available
+            local url
+            url=$(make_url "${DIST_ISO_URL[$distro]}" "$snapshot_date")
+            if ! url_exists "$url"; then
+                log_error "[$distro] Snapshot $snapshot_date not available at $url"
+                continue
+            fi
+        fi
+
+        process_distro "$distro" "$snapshot_date"
+    done
+}
+
+main "$@"
